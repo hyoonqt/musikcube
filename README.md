@@ -1,5 +1,12 @@
 # musikcube
 
+> **fork notice:** this is a personal fork of [clangen/musikcube](https://github.com/clangen/musikcube)
+> by [@hyoonqt](https://github.com/hyoonqt), adding local synced-lyrics support
+> (embedded tags + sidecar `.lrc` fallback, karaoke view). all credit for the
+> player itself belongs to casey langen and the musikcube contributors — see
+> [CONTRIBUTORS.txt](CONTRIBUTORS.txt). this fork is distributed under the same
+> [BSD-3-Clause license](LICENSE.txt) as the original.
+
 a cross-platform, terminal-based audio engine, library, player and server written in c++.
 
 musikcube compiles and runs easily on windows, macos and linux. it also runs well on a raspberry pi with raspbian, and can be setup as a streaming audio server.
