@@ -263,6 +263,7 @@
     <ClCompile Include="runtime\Message.cpp" />
     <ClCompile Include="runtime\MessageQueue.cpp" />
     <ClCompile Include="support\Auddio.cpp" />
+    <ClCompile Include="support\Lyrics.cpp" />
     <ClCompile Include="support\Common.cpp" />
     <ClCompile Include="support\Duration.cpp" />
     <ClCompile Include="support\LastFm.cpp" />
@@ -391,6 +392,7 @@
     <ClInclude Include="sdk\ReplayGain.h" />
     <ClInclude Include="sdk\String.h" />
     <ClInclude Include="support\Auddio.h" />
+    <ClInclude Include="support\Lyrics.h" />
     <ClInclude Include="support\Common.h" />
     <ClInclude Include="support\DeleteDefaults.h" />
     <ClInclude Include="support\Duration.h" />

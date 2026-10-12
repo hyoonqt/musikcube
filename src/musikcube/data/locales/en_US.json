@@ -207,6 +207,8 @@
     "shortcuts_filter": "filter",
     "shortcuts_library": "library",
     "shortcuts_lyrics": "lyrics",
+    "shortcuts_lyrics_focus": "focus",
+    "shortcuts_lyrics_seek": "seek",
     "shortcuts_play_queue": "play queue",
     "shortcuts_quit": "quit",
     "shortcuts_settings": "settings",

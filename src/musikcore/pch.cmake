@@ -131,6 +131,7 @@ target_precompile_headers(musikcore
     "$<$<COMPILE_LANGUAGE:CXX>:sdk/String.h>"
     "$<$<COMPILE_LANGUAGE:CXX>:sdk/version.h>"
     "$<$<COMPILE_LANGUAGE:CXX>:support/Auddio.h>"
+    "$<$<COMPILE_LANGUAGE:CXX>:support/Lyrics.h>"
     "$<$<COMPILE_LANGUAGE:CXX>:support/Common.h>"
     "$<$<COMPILE_LANGUAGE:CXX>:support/DeleteDefaults.h>"
     "$<$<COMPILE_LANGUAGE:CXX>:support/Duration.h>"

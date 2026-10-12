@@ -181,6 +181,9 @@
     <ClCompile Include="support\Auddio.cpp">
       <Filter>src\support</Filter>
     </ClCompile>
+    <ClCompile Include="support\Lyrics.cpp">
+      <Filter>src\support</Filter>
+    </ClCompile>
     <ClCompile Include="library\LocalMetadataProxy.cpp">
       <Filter>src\library</Filter>
     </ClCompile>
@@ -532,6 +535,9 @@
       <Filter>src\sdk</Filter>
     </ClInclude>
     <ClInclude Include="support\Auddio.h">
+      <Filter>src\support</Filter>
+    </ClInclude>
+    <ClInclude Include="support\Lyrics.h">
       <Filter>src\support</Filter>
     </ClInclude>
     <ClInclude Include="sdk\IMetadataProxy.h">

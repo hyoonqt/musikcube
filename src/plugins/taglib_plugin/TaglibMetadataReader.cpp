@@ -49,6 +49,8 @@
 #include <taglib/id3v2frame.h>
 #include <taglib/attachedpictureframe.h>
 #include <taglib/commentsframe.h>
+#include <taglib/synchronizedlyricsframe.h>
+#include <taglib/unsynchronizedlyricsframe.h>
 #include <taglib/mp4file.h>
 #include <taglib/oggfile.h>
 #include <taglib/opusfile.h>
@@ -324,6 +326,7 @@ bool TaglibMetadataReader::ReadGeneric(
                     this->ExtractValueForKey(mp4TagMap, "aART", "album_artist", target);
                     this->ExtractValueForKey(mp4TagMap, "disk", "disc", target);
                     this->ExtractReplayGain(mp4TagMap, target);
+                    this->ExtractLyricsFromMp4Map(mp4TagMap, target);
                     handled = true;
                 }
             }
@@ -335,6 +338,16 @@ bool TaglibMetadataReader::ReadGeneric(
                     this->ExtractReplayGain(wvFile->properties(), target);
                     handled = true;
                 }
+            }
+        }
+
+        /* generic fallback: normalized properties often carry LYRICS for
+        formats where the branch above did not apply (or only partially) */
+        if (!target->Contains("lyrics")) {
+            try {
+                this->ExtractLyricsFromMap(tag->properties(), target);
+            }
+            catch (...) {
             }
         }
 
@@ -389,11 +402,195 @@ void TaglibMetadataReader::ExtractValueForKey(
 }
 
 template <typename T>
+void TaglibMetadataReader::ExtractLyricsFromMap(const T& map, ITagStore *target) {
+    if (target->Contains("lyrics")) {
+        return;
+    }
+    try {
+        std::string best;
+        for (auto it = map.begin(); it != map.end(); ++it) {
+            std::string key = str::ToLowerCopy(it->first.to8Bit(true));
+            std::string normalized;
+            normalized.reserve(key.size());
+            for (char c : key) {
+                if (c != ' ' && c != '_' && c != '-') {
+                    normalized.push_back(c);
+                }
+            }
+            /* matches LYRICS, UNSYNCEDLYRICS, SYNCEDLYRICS, "lyrics-eng", ... */
+            if (normalized.find("lyrics") == std::string::npos) {
+                continue;
+            }
+            const TagLib::StringList& values = it->second;
+            for (auto vi = values.begin(); vi != values.end(); ++vi) {
+                std::string candidate(vi->to8Bit(true));
+                /* skip empty values; keep the longest (fullest) lyrics */
+                if (candidate.size() > best.size()) {
+                    /* trim trailing whitespace-only? keep raw so LRC
+                    timestamps survive for the display normalizer */
+                    bool nonBlank = false;
+                    for (char c : candidate) {
+                        if (c != ' ' && c != '\n' && c != '\r' && c != '\t') {
+                            nonBlank = true;
+                            break;
+                        }
+                    }
+                    if (nonBlank) {
+                        best = candidate;
+                    }
+                }
+            }
+        }
+        if (best.size()) {
+            this->SetTagValue("lyrics", best.c_str(), target);
+        }
+    }
+    catch (...) {
+    }
+}
+
+void TaglibMetadataReader::ExtractLyricsFromMp4Map(
+    const TagLib::MP4::ItemMap& map,
+    ITagStore *target)
+{
+    if (target->Contains("lyrics")) {
+        return;
+    }
+    try {
+        /* preferred atoms first */
+        static const char* kPreferred[] = {
+            u8"©lyr",
+            "----:com.apple.iTunes:LYRICS",
+            "----:com.apple.iTunes:Lyrics",
+            "----:com.apple.iTunes:UNSYNCED LYRICS",
+            "lyrics",
+            "LYRICS",
+        };
+        for (auto key : kPreferred) {
+            if (map.contains(key)) {
+                TagLib::StringList values = map[key].toStringList();
+                std::string best;
+                for (auto vi = values.begin(); vi != values.end(); ++vi) {
+                    std::string candidate(vi->to8Bit(true));
+                    if (candidate.size() > best.size()) {
+                        best = candidate;
+                    }
+                }
+                if (best.size()) {
+                    this->SetTagValue("lyrics", best.c_str(), target);
+                    return;
+                }
+            }
+        }
+        /* fallback: any key containing "lyr" (case-insensitive) */
+        std::string best;
+        for (auto it = map.begin(); it != map.end(); ++it) {
+            std::string key = str::ToLowerCopy(it->first.to8Bit(true));
+            if (key.find("lyr") == std::string::npos) {
+                continue;
+            }
+            TagLib::StringList values = it->second.toStringList();
+            for (auto vi = values.begin(); vi != values.end(); ++vi) {
+                std::string candidate(vi->to8Bit(true));
+                if (candidate.size() > best.size()) {
+                    best = candidate;
+                }
+            }
+        }
+        if (best.size()) {
+            this->SetTagValue("lyrics", best.c_str(), target);
+        }
+    }
+    catch (...) {
+    }
+}
+
+void TaglibMetadataReader::ExtractLyricsFromID3V2(
+    const TagLib::ID3v2::FrameListMap& allTags,
+    ITagStore *target)
+{
+    if (target->Contains("lyrics")) {
+        return;
+    }
+    try {
+        /* 1. prefer USLT (unsynchronized) frames */
+        auto usltIt = allTags.find("USLT");
+        if (usltIt != allTags.end() && !usltIt->second.isEmpty()) {
+            std::string best;
+            for (auto frame : usltIt->second) {
+                std::string candidate;
+                auto ulf = dynamic_cast<TagLib::ID3v2::UnsynchronizedLyricsFrame*>(frame);
+                if (ulf) {
+                    candidate = ulf->text().to8Bit(true);
+                }
+                else {
+                    candidate = frame->toString().to8Bit(true);
+                }
+                if (candidate.size() > best.size()) {
+                    best = candidate;
+                }
+            }
+            if (best.size()) {
+                this->SetTagValue("lyrics", best.c_str(), target);
+                return;
+            }
+        }
+
+        /* 2. fall back to SYLT (synchronized) frames, rendered as LRC so
+        the shared display normalizer can strip timestamps uniformly */
+        auto syltIt = allTags.find("SYLT");
+        if (syltIt != allTags.end() && !syltIt->second.isEmpty()) {
+            std::string best;
+            for (auto frame : syltIt->second) {
+                auto slf = dynamic_cast<TagLib::ID3v2::SynchronizedLyricsFrame*>(frame);
+                if (!slf) {
+                    continue;
+                }
+                auto entries = slf->synchedText();
+                if (entries.isEmpty()) {
+                    continue;
+                }
+                std::string lrc;
+                bool msTimestamps =
+                    (slf->timestampFormat() ==
+                        TagLib::ID3v2::SynchronizedLyricsFrame::AbsoluteMilliseconds);
+                for (auto ei = entries.begin(); ei != entries.end(); ++ei) {
+                    std::string text = ei->text.to8Bit(true);
+                    if (!lrc.empty()) {
+                        lrc.push_back('\n');
+                    }
+                    if (msTimestamps) {
+                        unsigned int ms = ei->time;
+                        unsigned int mm = ms / 60000;
+                        unsigned int ss = (ms % 60000) / 1000;
+                        unsigned int xx = (ms % 1000) / 10;
+                        char stamp[16];
+                        snprintf(stamp, sizeof(stamp), "[%02u:%02u.%02u]", mm, ss, xx);
+                        lrc += stamp;
+                    }
+                    lrc += text;
+                }
+                if (lrc.size() > best.size()) {
+                    best = lrc;
+                }
+            }
+            if (best.size()) {
+                this->SetTagValue("lyrics", best.c_str(), target);
+                return;
+            }
+        }
+    }
+    catch (...) {
+    }
+}
+
+template <typename T>
 void TaglibMetadataReader::ReadFromMap(const T& map, ITagStore *target) {
     ExtractValueForKey(map, "DISCNUMBER", "disc", target);
     ExtractValueForKey(map, "ALBUM ARTIST", "album_artist", target);
     ExtractValueForKey(map, "ALBUMARTIST", "album_artist", target);
     ExtractValueForKey(map, "RATING", "rating", target);
+    ExtractLyricsFromMap(map, target);
 }
 
 template<typename T>
@@ -584,7 +781,7 @@ bool TaglibMetadataReader::ReadID3V2(TagLib::ID3v2::Tag *id3v2, ITagStore *track
             this->SetTagValues("mood", allTags["TMOO"], track);
             this->SetTagValues("org.artist", allTags["TOPE"], track);
             this->SetTagValues("language", allTags["TLAN"], track);
-            this->SetTagValues("lyrics", allTags["USLT"], track);
+            this->ExtractLyricsFromID3V2(allTags, track);
             this->SetTagValues("disc", allTags["TPOS"], track);
 
             /* genre. note that multiple genres may be present */
