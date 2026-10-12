@@ -41,6 +41,7 @@ namespace musik { namespace cube {
             void LoadLyricsForCurrentTrack();
             void UpdateAdapter();
             void UpdateHighlight(int64_t positionMs, bool force);
+            void ScheduleProgressTick();
             void CenterOnLine(int index);
             int LineIndexForPosition(int64_t positionMs);
 

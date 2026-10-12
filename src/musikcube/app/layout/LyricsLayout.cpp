@@ -101,10 +101,20 @@ void LyricsLayout::OnTrackChanged(size_t index, TrackPtr track) {
 }
 
 void LyricsLayout::OnTimeChanged(double seconds) {
-    /* forwarded to the UI thread; the audio thread must never touch
-    windows directly. ignored unless we're showing lines. */
+    /* instant response for seeks (normal playback ticks come from the
+    self-perpetuating LyricsProgress loop below, because TimeChanged
+    only fires on seeks/mode changes -- not continuously). */
     if (this->IsVisible() && this->state == State::Loaded) {
         this->Post(message::LyricsProgress, (int64_t) (seconds * 1000.0));
+    }
+}
+
+void LyricsLayout::ScheduleProgressTick() {
+    /* TransportWindow parity: there is no continuous time signal, so poll
+    GetPosition() on a short loop while the view is live. Debounce
+    collapses repeats; the loop stops itself when hidden/unloaded. */
+    if (this->IsVisible() && this->state == State::Loaded) {
+        this->Debounce(message::LyricsProgress, 0, 0, 250);
     }
 }
 
@@ -202,6 +212,7 @@ void LyricsLayout::OnLyricsLoaded() {
     this->UpdateAdapter();
     this->SetState(State::Loaded);
     this->UpdateHighlight((int64_t) (this->playback.GetPosition() * 1000.0), true);
+    this->ScheduleProgressTick();
 }
 
 bool LyricsLayout::KeyPress(const std::string& kn) {
@@ -239,9 +250,10 @@ void LyricsLayout::OnVisibilityChanged(bool visible) {
     if (visible) {
         this->LoadLyricsForCurrentTrack();
         /* same track still showing: resync the highlight to the live
-        position (ticks only arrive while visible). */
+        position and restart ticks (ticks only run while visible). */
         if (this->state == State::Loaded) {
             this->UpdateHighlight((int64_t) (this->playback.GetPosition() * 1000.0), true);
+            this->ScheduleProgressTick();
         }
         this->FocusFirst();
     }
@@ -260,12 +272,14 @@ void LyricsLayout::ProcessMessage(musik::core::runtime::IMessage &m) {
         }
     }
     else if (m.Type() == message::LyricsProgress) {
-        /* playback tick (see OnTimeChanged): advance the highlight only
-        for the track the lines belong to. */
+        /* playback tick: poll the live position (the message itself
+        carries no position -- seeks post one immediately, the Debounce
+        loop below keeps it advancing during normal playback). */
         auto track = this->playback.GetPlaying();
         if (track && track->GetId() == this->currentTrackId) {
-            this->UpdateHighlight((int64_t) m.UserData1(), false);
+            this->UpdateHighlight((int64_t) (this->playback.GetPosition() * 1000.0), false);
         }
+        this->ScheduleProgressTick();
     }
     else {
         LayoutBase::ProcessMessage(m);
