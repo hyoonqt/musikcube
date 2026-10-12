@@ -360,6 +360,7 @@ void LyricsLayout::UpdateAdapter() {
 }
 
 void LyricsLayout::SetState(State state) {
+    this->state = state;
     switch (state) {
         case State::NotPlaying: {
                 this->listView->Hide();
