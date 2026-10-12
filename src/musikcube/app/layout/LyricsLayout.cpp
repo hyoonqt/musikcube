@@ -37,6 +37,7 @@
 #include <app/util/Messages.h>
 #include <musikcore/i18n/Locale.h>
 #include <musikcore/support/Auddio.h>
+#include <musikcore/support/Lyrics.h>
 #include <musikcore/sdk/String.h>
 #include <musikcore/library/query/LyricsQuery.h>
 #include <cursespp/App.h>
@@ -157,22 +158,35 @@ void LyricsLayout::LoadLyricsForCurrentTrack() {
         this->currentLyrics = "";
         this->SetState(State::Loading);
         const auto trackExternalId = track->GetString("external_id");
+        /* capture up-front: the db callback runs async and the track may
+        change underneath us; filename is needed for sidecar lookup. */
+        const auto audioFilename = track->GetString("filename");
         auto lyricsDbQuery = std::make_shared<LyricsQuery>(trackExternalId);
-        this->library->Enqueue(lyricsDbQuery, [this, lyricsDbQuery, track](auto q) {
+        this->library->Enqueue(lyricsDbQuery, [this, lyricsDbQuery, track, audioFilename](auto q) {
+            /* 1. embedded lyrics indexed from tags (FLAC/MP4/ID3v2 USLT/SYLT) */
             auto localLyrics = lyricsDbQuery->GetResult();
-            if (localLyrics.size()) {
+            if (support::lyrics::HasLyrics(localLyrics)) {
                 this->currentLyrics = localLyrics;
                 this->Post(message::LyricsLoaded, static_cast<int64_t>(State::Loaded));
+                return;
             }
-            else {
-                auddio::FindLyrics(track, [this](TrackPtr track, std::string remoteLyrics) {
-                    if (this->currentTrackId == track->GetId()) {
-                        this->currentLyrics = remoteLyrics;
-                        const auto state = remoteLyrics.size() ? State::Loaded : State::Failed;
-                        this->Post(message::LyricsLoaded, static_cast<int64_t>(state));
-                    }
-                });
+            /* 2. sidecar "<song>.lrc" next to the audio file */
+            auto sidecarLyrics = support::lyrics::LoadSidecar(audioFilename);
+            if (support::lyrics::HasLyrics(sidecarLyrics)) {
+                this->currentLyrics = sidecarLyrics;
+                this->Post(message::LyricsLoaded, static_cast<int64_t>(State::Loaded));
+                return;
             }
+            /* 3. default: remote lookup (auddio.io, requires API token) */
+            auddio::FindLyrics(track, [this](TrackPtr track, std::string remoteLyrics) {
+                if (this->currentTrackId == track->GetId()) {
+                    this->currentLyrics = remoteLyrics;
+                    const auto state = support::lyrics::HasLyrics(remoteLyrics)
+                        ? State::Loaded
+                        : State::Failed;
+                    this->Post(message::LyricsLoaded, static_cast<int64_t>(state));
+                }
+            });
         });
     }
     else if (!track) {
@@ -182,7 +196,10 @@ void LyricsLayout::LoadLyricsForCurrentTrack() {
 }
 
 void LyricsLayout::UpdateAdapter() {
-    std::string fixed = this->currentLyrics;
+    /* provider files are synced LRC ([mm:ss.xx] + [ti:]/[ar:]/... headers).
+    normalize to clean readable lines so local lyrics match what other
+    players show; plain remote lyrics pass through unchanged. */
+    std::string fixed = support::lyrics::NormalizeForDisplay(this->currentLyrics);
     str::ReplaceAll(fixed, "\r\n", "\n");
     str::ReplaceAll(fixed, "\r", "\n");
     auto items = str::Split(fixed, "\n");

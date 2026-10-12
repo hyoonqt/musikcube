@@ -60,6 +60,7 @@ set(CORE_SOURCES
   ./runtime/Message.cpp
   ./runtime/MessageQueue.cpp
   ./support/Auddio.cpp
+  ./support/Lyrics.cpp
   ./support/Duration.cpp
   ./support/Common.cpp
   ./support/LastFm.cpp

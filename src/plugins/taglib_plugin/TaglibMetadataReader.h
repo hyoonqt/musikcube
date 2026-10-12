@@ -79,6 +79,18 @@ class TaglibMetadataReader : public musik::core::sdk::ITagReader {
             const T& map,
             musik::core::sdk::ITagStore *target);
 
+        template <typename T> void ExtractLyricsFromMap(
+            const T& map,
+            musik::core::sdk::ITagStore *target);
+
+        void ExtractLyricsFromMp4Map(
+            const TagLib::MP4::ItemMap& map,
+            musik::core::sdk::ITagStore *target);
+
+        void ExtractLyricsFromID3V2(
+            const TagLib::ID3v2::FrameListMap& allTags,
+            musik::core::sdk::ITagStore *target);
+
         template<typename T> void ReadBasicData(
             const T* tag,
             const char* uri,

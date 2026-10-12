@@ -169,6 +169,7 @@
 #include <musikcore/sdk/ReplayGain.h>
 #include <musikcore/sdk/String.h>
 #include <musikcore/support/Auddio.h>
+#include <musikcore/support/Lyrics.h>
 #include <musikcore/support/Common.h>
 #include <musikcore/support/DeleteDefaults.h>
 #include <musikcore/support/Duration.h>
