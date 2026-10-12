@@ -1,13 +1,41 @@
-# musikcube
+# musikcube (forked)
 
-> **fork notice:** this is a personal fork of [clangen/musikcube](https://github.com/clangen/musikcube)
-> by [@hyoonqt](https://github.com/hyoonqt), adding local synced-lyrics support
-> (embedded tags + sidecar `.lrc` fallback, karaoke view). all credit for the
-> player itself belongs to casey langen and the musikcube contributors — see
-> [CONTRIBUTORS.txt](CONTRIBUTORS.txt). this fork is distributed under the same
-> [BSD-3-Clause license](LICENSE.txt) as the original.
+a music player forked from [clangen/musikcube](https://github.com/clangen/musikcube)
+with added support for embedded lyrics and dedicated `.lrc` files, checkout the upstream for more info!
 
-a cross-platform, terminal-based audio engine, library, player and server written in c++.
+# Forked version installation guide
+
+this fork is source-only: there is no package for it, build it and run it from the repo:
+
+```sh
+# dependencies (arch/cachyos; see the
+# [upstream build guide](https://github.com/clangen/musikcube/wiki/building)
+# for other distros). libmicrohttpd is required for the streaming plugin.
+sudo pacman -S base-devel cmake libogg libvorbis libmicrohttpd ffmpeg lame \
+  ncurses libpulse alsa-lib curl libev taglib libopenmpt pkg-config
+
+# clone with submodules (asio headers live there)
+git clone --recursive https://github.com/hyoonqt/musikcube.git
+cd musikcube
+
+# configure + build (binaries land in ./bin/)
+cmake -S . -B /tmp/musikcube-build -DCMAKE_BUILD_TYPE=Release
+make -C /tmp/musikcube-build -j$(nproc)
+
+# run it (uses your real ~/.config/musikcube library)
+./bin/musikcube
+```
+
+tip: run with a throwaway home (`HOME=/tmp/mkctest ./bin/musikcube`) to try it
+without touching your main library and settings.
+
+# legal
+
+this is a fork of [clangen/musikcube](https://github.com/clangen/musikcube) by
+[@hyoonqt](https://github.com/hyoonqt). all credit for the player itself
+belongs to casey langen and the musikcube contributors — see
+[CONTRIBUTORS.txt](CONTRIBUTORS.txt). this fork is distributed under the same
+[BSD-3-Clause license](LICENSE.txt) as the original.
 
 musikcube compiles and runs easily on windows, macos and linux. it also runs well on a raspberry pi with raspbian, and can be setup as a streaming audio server.
 
