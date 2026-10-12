@@ -41,6 +41,8 @@
 #include <musikcore/support/Lyrics.h>
 #include <musikcore/sdk/String.h>
 #include <musikcore/library/query/LyricsQuery.h>
+#include <musikcore/support/Preferences.h>
+#include <app/util/PreferenceKeys.h>
 #include <cursespp/App.h>
 #include <cursespp/Screen.h>
 #include <cursespp/ToastOverlay.h>
@@ -76,6 +78,12 @@ LyricsLayout::LyricsLayout(PlaybackService& playback, ILibraryPtr library)
     this->infoText = std::make_shared<TextLabel>("", text::AlignCenter);
     this->AddWindow(this->infoText);
 
+    /* same transport bar as the library view: time slider, volume, mode.
+    display-only here (FocusNone) so arrows keep scrolling lyrics. */
+    this->transportView = std::make_shared<TransportWindow>(library, playback);
+    this->transportView->SetFocus(TransportWindow::FocusNone);
+    this->AddWindow(this->transportView);
+
     this->LoadLyricsForCurrentTrack();
 }
 
@@ -83,8 +91,25 @@ void LyricsLayout::OnLayout() {
     LayoutBase::OnLayout();
     const int cx = this->GetContentWidth();
     const int cy = this->GetContentHeight();
-    this->listView->MoveAndResize(0, 0, cx, cy);
-    this->infoText->MoveAndResize(1, cy / 2, cx - 2, 1);
+#ifdef WIN32
+    const int transportCy = 3;
+#else
+    const bool autoHideCommandBar = Preferences::ForComponent("settings")
+        ->GetBool(prefs::keys::AutoHideCommandBar, false);
+    const int transportCy = (autoHideCommandBar ? 2 : 3);
+#endif
+    const int listHeight = std::max(0, cy - transportCy);
+    if (this->focusMode) {
+        /* 3-line karaoke strip, vertically centered in the list area */
+        const int stripHeight = 3;
+        const int stripY = std::max(0, (listHeight - stripHeight) / 2);
+        this->listView->MoveAndResize(0, stripY, cx, stripHeight);
+    }
+    else {
+        this->listView->MoveAndResize(0, 0, cx, listHeight);
+    }
+    this->transportView->MoveAndResize(1, listHeight, cx - 2, transportCy);
+    this->infoText->MoveAndResize(1, listHeight / 2, cx - 2, 1);
     /* entry centering is width-dependent; rebuild when the width changes
     (also fixes stale ellipsis clipping after a resize). */
     if (cx != (int) this->lastLayoutWidth && this->currentLyrics.size()) {
@@ -151,13 +176,110 @@ void LyricsLayout::CenterOnLine(int index) {
         this->listView->ScrollTo(0);
         return;
     }
-    size_t half = visible / 2;
-    size_t target = (size_t) index <= half ? 0 : (size_t) index - half;
+    size_t target;
+    if (this->focusMode) {
+        /* 3-line strip: previous/current/next. at the very start the
+        strip stays pinned so lines 1+2 fill the first rows. */
+        target = index <= 1 ? 0 : (size_t) index - 1;
+    }
+    else {
+        size_t half = visible / 2;
+        target = (size_t) index <= half ? 0 : (size_t) index - half;
+    }
     size_t maxFirst = count - visible;
     if (target > maxFirst) {
         target = maxFirst;
     }
     this->listView->ScrollTo(target);
+}
+
+void LyricsLayout::ApplyEntryStates() {
+    /* the cursor (manual navigation) always wins visually; otherwise the
+    playback highlight shows. both are tracked independently. */
+    const size_t count = this->adapter->GetEntryCount();
+    for (size_t i = 0; i < count; i++) {
+        auto entry = this->adapter->GetEntry(this->listView.get(), i);
+        auto lyric = static_cast<LyricLineEntry*>(entry.get());
+        if ((int) i == this->cursorIndex) {
+            lyric->SetAttrs(Color(Color::ListItemHighlighted));
+        }
+        else if ((int) i == this->currentLineIndex) {
+            lyric->SetLyricState(LyricLineEntry::State::Current);
+        }
+        else if (this->currentLineIndex >= 0 && (int) i < this->currentLineIndex) {
+            lyric->SetLyricState(LyricLineEntry::State::Past);
+        }
+        else {
+            lyric->SetLyricState(LyricLineEntry::State::Upcoming);
+        }
+    }
+}
+
+void LyricsLayout::EnsureCursorVisible() {
+    const size_t count = this->adapter->GetEntryCount();
+    if (!count) {
+        return;
+    }
+    if (this->cursorIndex < 0) {
+        this->cursorIndex = 0;
+    }
+    if (this->cursorIndex >= (int) count) {
+        this->cursorIndex = (int) count - 1;
+    }
+    auto pos = this->listView->GetScrollPosition();
+    if ((size_t) this->cursorIndex < pos.firstVisibleEntryIndex) {
+        this->listView->ScrollTo((size_t) this->cursorIndex);
+    }
+    else if ((size_t) this->cursorIndex >= pos.firstVisibleEntryIndex + pos.visibleEntryCount) {
+        size_t target = (size_t) this->cursorIndex + 1 - pos.visibleEntryCount;
+        this->listView->ScrollTo(target);
+    }
+    else {
+        this->listView->Invalidate();
+    }
+}
+
+void LyricsLayout::MoveCursorTo(int index) {
+    const size_t count = this->adapter->GetEntryCount();
+    if (!count) {
+        return;
+    }
+    if (index < 0) {
+        index = 0;
+    }
+    if (index >= (int) count) {
+        index = (int) count - 1;
+    }
+    this->followPlayback = false;
+    this->cursorIndex = index;
+    this->ApplyEntryStates();
+    this->EnsureCursorVisible();
+}
+
+void LyricsLayout::MoveCursor(int delta) {
+    this->MoveCursorTo(this->cursorIndex + delta);
+}
+
+void LyricsLayout::SeekToCursor() {
+    const size_t count = this->adapter->GetEntryCount();
+    if (!count || this->cursorIndex < 0 || this->cursorIndex >= (int) count) {
+        return;
+    }
+    double seconds = -1.0;
+    if (this->lyricsSynced && this->cursorIndex < (int) this->parsedLyrics.lines.size()) {
+        seconds = (double) this->parsedLyrics.lines[(size_t) this->cursorIndex].ms / 1000.0;
+    }
+    else if (this->lastDuration > 0.0) {
+        /* unsynced estimate: line position mapped onto the duration */
+        seconds = (double) this->cursorIndex * this->lastDuration / (double) count;
+    }
+    if (seconds >= 0.0) {
+        /* seeking jumps straight back into follow mode so the highlight
+        picks up from the new position. */
+        this->followPlayback = true;
+        this->playback.SetPosition(seconds);
+        this->UpdateHighlight((int64_t) (seconds * 1000.0), true);
+    }
 }
 
 void LyricsLayout::UpdateHighlight(int64_t positionMs, bool force) {
@@ -169,20 +291,12 @@ void LyricsLayout::UpdateHighlight(int64_t positionMs, bool force) {
         return;
     }
     this->currentLineIndex = index;
-    const size_t count = this->adapter->GetEntryCount();
-    for (size_t i = 0; i < count; i++) {
-        auto entry = this->adapter->GetEntry(this->listView.get(), i);
-        auto lyric = static_cast<LyricLineEntry*>(entry.get());
-        if ((int) i == index) {
-            lyric->SetLyricState(LyricLineEntry::State::Current);
-        }
-        else if (index >= 0 && (int) i < index) {
-            lyric->SetLyricState(LyricLineEntry::State::Past);
-        }
-        else {
-            lyric->SetLyricState(LyricLineEntry::State::Upcoming);
-        }
+    /* while following, the cursor rides the highlight; manual navigation
+    takes over (and pauses follow) until a seek, retry or new track. */
+    if (this->followPlayback && index >= 0) {
+        this->cursorIndex = index;
     }
+    this->ApplyEntryStates();
     /* manual scrolling pauses the follow-scroll, but the highlight itself
     always tracks playback; a new track resumes following. */
     if (this->followPlayback) {
@@ -197,6 +311,7 @@ void LyricsLayout::OnLyricsLoaded() {
     this->parsedLyrics = support::lyrics::ParseSynced(this->currentLyrics);
     this->lyricsSynced = this->parsedLyrics.synced;
     this->currentLineIndex = -1;
+    this->cursorIndex = 0;
     this->followPlayback = true;
 
     auto track = this->playback.GetPlaying();
@@ -233,13 +348,43 @@ bool LyricsLayout::KeyPress(const std::string& kn) {
         playback.PauseOrResume();
         return true;
     }
-    else if (kn == "KEY_UP" || kn == "KEY_DOWN" ||
-             kn == "KEY_PPAGE" || kn == "KEY_NPAGE" ||
-             kn == "KEY_HOME" || kn == "KEY_END")
-    {
-        /* manual scrolling pauses the follow-scroll (the highlight keeps
-        tracking); a new track or retry resumes following. */
-        this->followPlayback = false;
+    else if (kn == "KEY_ENTER") {
+        /* karaoke seek: jump playback to the cursor's line */
+        this->SeekToCursor();
+        return true;
+    }
+    else if (kn == "z") {
+        /* 3-line focus strip toggle */
+        this->focusMode = !this->focusMode;
+        this->OnLayout();
+        this->UpdateHighlight((int64_t) (this->playback.GetPosition() * 1000.0), true);
+        return true;
+    }
+    else if (kn == "KEY_UP") {
+        this->MoveCursor(-1);
+        return true;
+    }
+    else if (kn == "KEY_DOWN") {
+        this->MoveCursor(1);
+        return true;
+    }
+    else if (kn == "KEY_PPAGE") {
+        const size_t visible = this->listView->GetScrollPosition().visibleEntryCount;
+        this->MoveCursor(-(int) (visible ? visible : 10));
+        return true;
+    }
+    else if (kn == "KEY_NPAGE") {
+        const size_t visible = this->listView->GetScrollPosition().visibleEntryCount;
+        this->MoveCursor((int) (visible ? visible : 10));
+        return true;
+    }
+    else if (kn == "KEY_HOME") {
+        this->MoveCursorTo(0);
+        return true;
+    }
+    else if (kn == "KEY_END") {
+        this->MoveCursorTo((int) this->adapter->GetEntryCount());
+        return true;
     }
 
     return LayoutBase::KeyPress(kn);
@@ -398,6 +543,8 @@ void LyricsLayout::SetState(State state) {
 void LyricsLayout::SetShortcutsWindow(ShortcutsWindow* shortcuts) {
     if (shortcuts) {
         shortcuts->AddShortcut(Hotkeys::Get(Hotkeys::NavigateLyrics), _TSTR("shortcuts_lyrics"));
+        shortcuts->AddShortcut("z", _TSTR("shortcuts_lyrics_focus"));
+        shortcuts->AddShortcut("KEY_ENTER", _TSTR("shortcuts_lyrics_seek"));
         shortcuts->AddShortcut(Hotkeys::Get(Hotkeys::NavigateLibrary), _TSTR("shortcuts_library"));
         shortcuts->AddShortcut(Hotkeys::Get(Hotkeys::NavigateLibraryPlayQueue), _TSTR("shortcuts_play_queue"));
         shortcuts->AddShortcut(App::Instance().GetQuitKey(), _TSTR("shortcuts_quit"));
