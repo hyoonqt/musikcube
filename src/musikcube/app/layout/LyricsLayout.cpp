@@ -34,6 +34,7 @@
 
 #include <stdafx.h>
 #include <app/layout/LyricsLayout.h>
+#include <app/layout/LyricLineEntry.h>
 #include <app/util/Messages.h>
 #include <musikcore/i18n/Locale.h>
 #include <musikcore/support/Auddio.h>
@@ -61,9 +62,12 @@ LyricsLayout::LyricsLayout(PlaybackService& playback, ILibraryPtr library)
 , library(library)
 , playback(playback) {
     this->playback.TrackChanged.connect(this, &LyricsLayout::OnTrackChanged);
+    this->playback.TimeChanged.connect(this, &LyricsLayout::OnTimeChanged);
 
     this->adapter = std::make_shared<SimpleScrollAdapter>();
-    this->adapter->SetSelectable(true);
+    /* selection is meaningless in a karaoke view (and fights the follow
+    highlight), so the highlight is driven purely by entry colors. */
+    this->adapter->SetSelectable(false);
 
     this->listView = std::make_shared<ListWindow>(this->adapter);
     this->AddWindow(this->listView);
@@ -81,6 +85,13 @@ void LyricsLayout::OnLayout() {
     const int cy = this->GetContentHeight();
     this->listView->MoveAndResize(0, 0, cx, cy);
     this->infoText->MoveAndResize(1, cy / 2, cx - 2, 1);
+    /* entry centering is width-dependent; rebuild when the width changes
+    (also fixes stale ellipsis clipping after a resize). */
+    if (cx != (int) this->lastLayoutWidth && this->currentLyrics.size()) {
+        this->lastLayoutWidth = (size_t) cx;
+        this->UpdateAdapter();
+        this->UpdateHighlight((int64_t) (this->playback.GetPosition() * 1000.0), true);
+    }
 }
 
 void LyricsLayout::OnTrackChanged(size_t index, TrackPtr track) {
@@ -89,24 +100,113 @@ void LyricsLayout::OnTrackChanged(size_t index, TrackPtr track) {
     }
 }
 
+void LyricsLayout::OnTimeChanged(double seconds) {
+    /* forwarded to the UI thread; the audio thread must never touch
+    windows directly. ignored unless we're showing lines. */
+    if (this->IsVisible() && this->state == State::Loaded) {
+        this->Post(message::LyricsProgress, (int64_t) (seconds * 1000.0));
+    }
+}
+
+int LyricsLayout::LineIndexForPosition(int64_t positionMs) {
+    const size_t count = this->adapter->GetEntryCount();
+    if (!count) {
+        return -1;
+    }
+    if (this->lyricsSynced) {
+        return support::lyrics::FindCurrentLine(this->parsedLyrics.lines, positionMs);
+    }
+    /* unsynced fallback (cmus-lyric parity): estimate by progress ratio */
+    if (this->lastDuration > 0.0) {
+        double pos = (double) positionMs / 1000.0;
+        int estimated = (int) (pos * (double) count / this->lastDuration);
+        if (estimated < 0) {
+            estimated = 0;
+        }
+        if (estimated >= (int) count) {
+            estimated = (int) count - 1;
+        }
+        return estimated;
+    }
+    return -1;
+}
+
+void LyricsLayout::CenterOnLine(int index) {
+    const size_t count = this->adapter->GetEntryCount();
+    if (!count || index < 0) {
+        return;
+    }
+    size_t visible = this->listView->GetScrollPosition().visibleEntryCount;
+    if (!visible || visible >= count) {
+        this->listView->ScrollTo(0);
+        return;
+    }
+    size_t half = visible / 2;
+    size_t target = (size_t) index <= half ? 0 : (size_t) index - half;
+    size_t maxFirst = count - visible;
+    if (target > maxFirst) {
+        target = maxFirst;
+    }
+    this->listView->ScrollTo(target);
+}
+
+void LyricsLayout::UpdateHighlight(int64_t positionMs, bool force) {
+    if (!this->adapter->GetEntryCount()) {
+        return;
+    }
+    int index = this->LineIndexForPosition(positionMs);
+    if (!force && index == this->currentLineIndex) {
+        return;
+    }
+    this->currentLineIndex = index;
+    const size_t count = this->adapter->GetEntryCount();
+    for (size_t i = 0; i < count; i++) {
+        auto entry = this->adapter->GetEntry(this->listView.get(), i);
+        auto lyric = static_cast<LyricLineEntry*>(entry.get());
+        if ((int) i == index) {
+            lyric->SetLyricState(LyricLineEntry::State::Current);
+        }
+        else if (index >= 0 && (int) i < index) {
+            lyric->SetLyricState(LyricLineEntry::State::Past);
+        }
+        else {
+            lyric->SetLyricState(LyricLineEntry::State::Upcoming);
+        }
+    }
+    /* manual scrolling pauses the follow-scroll, but the highlight itself
+    always tracks playback; a new track resumes following. */
+    if (this->followPlayback) {
+        this->CenterOnLine(index);
+    }
+    else {
+        this->listView->Invalidate();
+    }
+}
+
 void LyricsLayout::OnLyricsLoaded() {
-    this->UpdateAdapter();
-    this->listView->ScrollTo(0);
-    this->listView->SetSelectedIndex(0);
+    this->parsedLyrics = support::lyrics::ParseSynced(this->currentLyrics);
+    this->lyricsSynced = this->parsedLyrics.synced;
+    this->currentLineIndex = -1;
+    this->followPlayback = true;
 
     auto track = this->playback.GetPlaying();
     if (track) {
+        this->lastDuration = track->GetDouble("duration", 0.0);
         this->listView->SetFrameTitle(u8fmt(
             _TSTR("lyrics_list_title"),
             track->GetString("title").c_str(),
-            track->GetString("artist").c_str()));
+            track->GetString("artist").c_str()) +
+            (this->lyricSource.size() ? " [" + this->lyricSource + "]" : ""));
     }
 
+    this->UpdateAdapter();
     this->SetState(State::Loaded);
+    this->UpdateHighlight((int64_t) (this->playback.GetPosition() * 1000.0), true);
 }
 
 bool LyricsLayout::KeyPress(const std::string& kn) {
     if (Hotkeys::Is(Hotkeys::LyricsRetry, kn)) {
+        this->followPlayback = true;
         this->LoadLyricsForCurrentTrack();
         return true;
     }
@@ -122,6 +222,14 @@ bool LyricsLayout::KeyPress(const std::string& kn) {
         playback.PauseOrResume();
         return true;
     }
+    else if (kn == "KEY_UP" || kn == "KEY_DOWN" ||
+             kn == "KEY_PPAGE" || kn == "KEY_NPAGE" ||
+             kn == "KEY_HOME" || kn == "KEY_END")
+    {
+        /* manual scrolling pauses the follow-scroll (the highlight keeps
+        tracking); a new track or retry resumes following. */
+        this->followPlayback = false;
+    }
 
     return LayoutBase::KeyPress(kn);
 }
@@ -130,6 +238,11 @@ void LyricsLayout::OnVisibilityChanged(bool visible) {
     LayoutBase::OnVisibilityChanged(visible);
     if (visible) {
         this->LoadLyricsForCurrentTrack();
+        /* same track still showing: resync the highlight to the live
+        position (ticks only arrive while visible). */
+        if (this->state == State::Loaded) {
+            this->UpdateHighlight((int64_t) (this->playback.GetPosition() * 1000.0), true);
+        }
         this->FocusFirst();
     }
 }
@@ -146,6 +259,14 @@ void LyricsLayout::ProcessMessage(musik::core::runtime::IMessage &m) {
             this->SetState(state);
         }
     }
+    else if (m.Type() == message::LyricsProgress) {
+        /* playback tick (see OnTimeChanged): advance the highlight only
+        for the track the lines belong to. */
+        auto track = this->playback.GetPlaying();
+        if (track && track->GetId() == this->currentTrackId) {
+            this->UpdateHighlight((int64_t) m.UserData1(), false);
+        }
+    }
     else {
         LayoutBase::ProcessMessage(m);
     }
@@ -156,6 +277,12 @@ void LyricsLayout::LoadLyricsForCurrentTrack() {
     if (track && track->GetId() != this->currentTrackId) {
         this->currentTrackId = track->GetId();
         this->currentLyrics = "";
+        this->parsedLyrics = support::lyrics::ParsedLyrics();
+        this->currentLineIndex = -1;
+        this->followPlayback = true;
+        this->lyricsSynced = false;
+        this->lastDuration = 0.0;
+        this->lyricSource = "";
         this->SetState(State::Loading);
         const auto trackExternalId = track->GetString("external_id");
         /* capture up-front: the db callback runs async and the track may
@@ -167,6 +294,7 @@ void LyricsLayout::LoadLyricsForCurrentTrack() {
             auto localLyrics = lyricsDbQuery->GetResult();
             if (support::lyrics::HasLyrics(localLyrics)) {
                 this->currentLyrics = localLyrics;
+                this->lyricSource = "embedded";
                 this->Post(message::LyricsLoaded, static_cast<int64_t>(State::Loaded));
                 return;
             }
@@ -174,6 +302,7 @@ void LyricsLayout::LoadLyricsForCurrentTrack() {
             auto sidecarLyrics = support::lyrics::LoadSidecar(audioFilename);
             if (support::lyrics::HasLyrics(sidecarLyrics)) {
                 this->currentLyrics = sidecarLyrics;
+                this->lyricSource = ".lrc";
                 this->Post(message::LyricsLoaded, static_cast<int64_t>(State::Loaded));
                 return;
             }
@@ -181,6 +310,7 @@ void LyricsLayout::LoadLyricsForCurrentTrack() {
             auddio::FindLyrics(track, [this](TrackPtr track, std::string remoteLyrics) {
                 if (this->currentTrackId == track->GetId()) {
                     this->currentLyrics = remoteLyrics;
+                    this->lyricSource = "remote";
                     const auto state = support::lyrics::HasLyrics(remoteLyrics)
                         ? State::Loaded
                         : State::Failed;
@@ -196,16 +326,22 @@ void LyricsLayout::LoadLyricsForCurrentTrack() {
 }
 
 void LyricsLayout::UpdateAdapter() {
-    /* provider files are synced LRC ([mm:ss.xx] + [ti:]/[ar:]/... headers).
-    normalize to clean readable lines so local lyrics match what other
-    players show; plain remote lyrics pass through unchanged. */
+    this->adapter->Clear();
+    if (this->lyricsSynced) {
+        /* synced path: one centered entry per timestamped line; the
+        highlight follows playback (see UpdateHighlight). */
+        for (auto& line : this->parsedLyrics.lines) {
+            this->adapter->AddEntry(std::make_shared<LyricLineEntry>(line.text));
+        }
+        return;
+    }
+    /* unsynced path: plain readable lines, as before. */
     std::string fixed = support::lyrics::NormalizeForDisplay(this->currentLyrics);
     str::ReplaceAll(fixed, "\r\n", "\n");
     str::ReplaceAll(fixed, "\r", "\n");
     auto items = str::Split(fixed, "\n");
-    this->adapter->Clear();
     for (auto& text : items) {
-        this->adapter->AddEntry(std::make_shared<SingleLineEntry>(text));
+        this->adapter->AddEntry(std::make_shared<LyricLineEntry>(text));
     }
 }
 

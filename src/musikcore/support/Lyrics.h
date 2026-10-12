@@ -34,7 +34,9 @@
 
 #pragma once
 
+#include <cstdint>
 #include <string>
+#include <vector>
 
 namespace musik { namespace core { namespace support { namespace lyrics {
 
@@ -55,5 +57,26 @@ namespace musik { namespace core { namespace support { namespace lyrics {
     /* reads the sidecar .lrc file for the given audio file, if present.
     returns "" when missing/unreadable/empty. handles UTF-8 BOM. */
     std::string LoadSidecar(const std::string& audioPath);
+
+    struct SyncedLine {
+        int64_t ms = 0;      /* timestamp in milliseconds */
+        std::string text;    /* lyric text ("" for gap markers) */
+    };
+
+    struct ParsedLyrics {
+        std::vector<SyncedLine> lines;
+        bool synced = false; /* true when timestamped lines were found */
+        int offsetMs = 0;    /* global [offset:] shift, already applied */
+    };
+
+    /* full parse that KEEPS timestamps (unlike NormalizeForDisplay).
+    handles BOM/CRLF, full-width brackets/colons, [offset:], header tags,
+    repeated timestamps ("[00:12.40][00:15.00]text") and gap markers.
+    lines are sorted by timestamp with the offset applied. */
+    ParsedLyrics ParseSynced(const std::string& raw);
+
+    /* index of the last line with ms <= positionMs, or -1 when none
+    (or when lines is empty). drives the karaoke highlight. */
+    int FindCurrentLine(const std::vector<SyncedLine>& lines, int64_t positionMs);
 
 } } } }

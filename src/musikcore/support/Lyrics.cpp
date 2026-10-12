@@ -54,6 +54,9 @@ static std::string trimCopy(const std::string& s) {
     return s.substr(b, e - b);
 }
 
+static bool isHeaderTag(const std::string& line);
+static std::string stripTimestamps(std::string line);
+
 bool HasLyrics(const std::string& s) {
     for (char c : s) {
         if (!isSpace(c)) {
@@ -61,6 +64,265 @@ bool HasLyrics(const std::string& s) {
         }
     }
     return false;
+}
+
+/* cmus-lyric parity: some providers emit full-width brackets/colons,
+which break timestamp parsing. normalize them to half-width. */
+static std::string normalizeFullWidth(std::string s) {
+    static const char* kBrackets[][2] = {
+        { "\xEF\xBC\xBB", "[" }, /* ［ U+FF3B */
+        { "\xEF\xBC\xBD", "]" }, /* ］ U+FF3D */
+        { "\xE3\x80\x90", "[" }, /* 【 U+300C-ish open */
+        { "\xE3\x80\x91", "]" }, /* 】 close */
+    };
+    for (auto& pair : kBrackets) {
+        const std::string from = pair[0];
+        size_t pos = 0;
+        while ((pos = s.find(from, pos)) != std::string::npos) {
+            s.replace(pos, from.size(), pair[1]);
+            pos += 1;
+        }
+    }
+    /* full-width colon (EF BC 9A) only when flanked by digits: 00：05.00 */
+    const std::string colon = "\xEF\xBC\x9A";
+    {
+        size_t pos = 0;
+        while ((pos = s.find(colon, pos)) != std::string::npos) {
+            bool beforeDigit = pos > 0 && std::isdigit((unsigned char) s[pos - 1]);
+            bool afterDigit = pos + colon.size() < s.size() &&
+                std::isdigit((unsigned char) s[pos + colon.size()]);
+            if (beforeDigit && afterDigit) {
+                s.replace(pos, colon.size(), ":");
+                pos += 1;
+            }
+            else {
+                pos += colon.size();
+            }
+        }
+    }
+    return s;
+}
+
+static std::string normalizeLineEndings(std::string s) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] == '\r') {
+            out.push_back('\n');
+            if (i + 1 < s.size() && s[i + 1] == '\n') {
+                ++i;
+            }
+        }
+        else {
+            out.push_back(s[i]);
+        }
+    }
+    return out;
+}
+
+static std::string stripBom(std::string s) {
+    if (s.size() >= 3 &&
+        (unsigned char) s[0] == 0xEF &&
+        (unsigned char) s[1] == 0xBB &&
+        (unsigned char) s[2] == 0xBF)
+    {
+        s = s.substr(3);
+    }
+    return s;
+}
+
+/* parses the INSIDE of a [..]/<..> stamp ("mm:ss", "mm:ss.xx",
+"mm:ss:xx", "mm:ss,xxx"). returns -1 when not a timestamp. */
+static int64_t parseTimestampMs(const std::string& inside) {
+    size_t colon = inside.find(':');
+    if (colon == std::string::npos || colon == 0 || colon + 1 >= inside.size()) {
+        return -1;
+    }
+    for (size_t i = 0; i < inside.size(); i++) {
+        if (i == colon) {
+            continue;
+        }
+        char c = inside[i];
+        if (!std::isdigit((unsigned char) c) && c != '.' && c != ',') {
+            return -1;
+        }
+    }
+    try {
+        int minutes = std::stoi(inside.substr(0, colon));
+        std::string rest = inside.substr(colon + 1);
+        int seconds = 0, millis = 0;
+        size_t dot = rest.find_first_of(".,");
+        if (dot == std::string::npos) {
+            seconds = std::stoi(rest);
+        }
+        else {
+            seconds = std::stoi(rest.substr(0, dot));
+            std::string frac = rest.substr(dot + 1);
+            if (frac.empty() || frac.size() > 3) {
+                return -1;
+            }
+            for (char c : frac) {
+                if (!std::isdigit((unsigned char) c)) {
+                    return -1;
+                }
+            }
+            while (frac.size() < 3) {
+                frac.push_back('0');
+            }
+            millis = std::stoi(frac);
+        }
+        if (seconds < 0 || seconds >= 100 || minutes < 0) {
+            return -1;
+        }
+        return (int64_t) minutes * 60000 + (int64_t) seconds * 1000 + millis;
+    }
+    catch (...) {
+        return -1;
+    }
+}
+
+/* queue of leading stamps stripped from a line; returns the remainder.
+also used to detect multi-stamp lines ("[t1][t2]text"). */
+static std::vector<int64_t> takeLeadingStamps(std::string& line) {
+    std::vector<int64_t> stamps;
+    line = trimCopy(line);
+    while (!line.empty()) {
+        char open = line[0];
+        char expectedClose = (open == '[') ? ']' : (open == '<' ? '>' : 0);
+        if (!expectedClose) {
+            break;
+        }
+        size_t close = line.find(expectedClose);
+        if (close == std::string::npos || close < 3 || close > 12) {
+            break;
+        }
+        int64_t ms = parseTimestampMs(line.substr(1, close - 1));
+        if (ms < 0) {
+            break;
+        }
+        stamps.push_back(ms);
+        line = trimCopy(line.substr(close + 1));
+    }
+    return stamps;
+}
+
+static int parseOffsetMs(const std::string& line) {
+    /* matches "[offset:+500]" / "[offset: -250]" (case-insensitive) */
+    std::string t = trimCopy(line);
+    if (t.size() < 10 || t.front() != '[') {
+        return 0;
+    }
+    size_t close = t.find(']');
+    if (close == std::string::npos) {
+        return 0;
+    }
+    std::string inside = trimCopy(t.substr(1, close - 1));
+    size_t colon = inside.find(':');
+    if (colon == std::string::npos) {
+        return 0;
+    }
+    std::string name = trimCopy(inside.substr(0, colon));
+    std::string lower;
+    lower.reserve(name.size());
+    for (char c : name) {
+        lower.push_back((char) std::tolower((unsigned char) c));
+    }
+    if (lower != "offset") {
+        return 0;
+    }
+    try {
+        return std::stoi(trimCopy(inside.substr(colon + 1)));
+    }
+    catch (...) {
+        return 0;
+    }
+}
+
+ParsedLyrics ParseSynced(const std::string& raw) {
+    ParsedLyrics result;
+    if (raw.empty()) {
+        return result;
+    }
+
+    std::string fixed = stripBom(normalizeFullWidth(normalizeLineEndings(raw)));
+
+    std::stringstream in(fixed);
+    std::string line;
+    int64_t lastMs = 0;
+    bool sawOffset = false;
+
+    struct RawLine { int64_t ms; std::string text; bool stamped; };
+    std::vector<RawLine> pending;
+
+    while (std::getline(in, line, '\n')) {
+        std::string t = trimCopy(line);
+        if (t.empty()) {
+            continue;
+        }
+        if (!sawOffset) {
+            int off = parseOffsetMs(t);
+            if (off != 0 || t.size() >= 9) {
+                /* parseOffsetMs returns 0 both for "[offset:0]" and for
+                non-offset lines; only consume the line as an offset
+                declaration when it actually is one. */
+                std::string low = t;
+                for (char& c : low) { c = (char) std::tolower((unsigned char) c); }
+                if (low.find("[offset:") == 0) {
+                    result.offsetMs = off;
+                    sawOffset = true;
+                    continue;
+                }
+            }
+        }
+        if (isHeaderTag(t)) {
+            continue;
+        }
+        std::string rest = t;
+        auto stamps = takeLeadingStamps(rest);
+        if (stamps.empty()) {
+            /* unstamped lyric line: continuation of the previous stamp
+            (credit lines, translations without their own time). */
+            pending.push_back({ lastMs, t, false });
+        }
+        else {
+            for (int64_t ms : stamps) {
+                pending.push_back({ ms, rest, true });
+                lastMs = ms;
+            }
+            result.synced = true;
+        }
+    }
+
+    if (pending.empty()) {
+        return result;
+    }
+
+    /* stable sort keeps file order for identical timestamps */
+    std::stable_sort(pending.begin(), pending.end(),
+        [](const RawLine& a, const RawLine& b) { return a.ms < b.ms; });
+
+    result.lines.reserve(pending.size());
+    for (auto& p : pending) {
+        int64_t ms = p.ms + result.offsetMs;
+        if (ms < 0) {
+            ms = 0;
+        }
+        result.lines.push_back({ ms, p.text });
+    }
+    return result;
+}
+
+int FindCurrentLine(const std::vector<SyncedLine>& lines, int64_t positionMs) {
+    int current = -1;
+    for (size_t i = 0; i < lines.size(); i++) {
+        if (lines[i].ms <= positionMs) {
+            current = (int) i;
+        }
+        else {
+            break; /* lines are sorted */
+        }
+    }
+    return current;
 }
 
 /* true for LRC header tags like [ti:...], [ar:...], [al:...], [by:...],
@@ -167,32 +429,7 @@ std::string NormalizeForDisplay(const std::string& raw) {
         return raw;
     }
 
-    std::string fixed = raw;
-    /* normalize line endings */
-    {
-        std::string out;
-        out.reserve(fixed.size());
-        for (size_t i = 0; i < fixed.size(); i++) {
-            if (fixed[i] == '\r') {
-                out.push_back('\n');
-                if (i + 1 < fixed.size() && fixed[i + 1] == '\n') {
-                    ++i;
-                }
-            }
-            else {
-                out.push_back(fixed[i]);
-            }
-        }
-        fixed = out;
-    }
-    /* strip UTF-8 BOM if present */
-    if (fixed.size() >= 3 &&
-        (unsigned char) fixed[0] == 0xEF &&
-        (unsigned char) fixed[1] == 0xBB &&
-        (unsigned char) fixed[2] == 0xBF)
-    {
-        fixed = fixed.substr(3);
-    }
+    std::string fixed = stripBom(normalizeFullWidth(normalizeLineEndings(raw)));
 
     std::stringstream in(fixed);
     std::string line, out;
